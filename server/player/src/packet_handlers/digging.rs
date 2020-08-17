@@ -152,51 +152,88 @@ fn handle_started_digging(
 /// System to advance the digging progress.
 #[fecs::system]
 pub fn advance_dig_progress(game: &mut Game, world: &mut World) {
-    <(Write<Digging>, Read<Inventory>, Read<HeldItem>)>::query().par_for_each_mut(
+    <(
+        Write<Digging>,
+        Read<Inventory>,
+        Read<HeldItem>,
+        Read<Position>,
+    )>::query()
+    .par_for_each_mut(
         world.inner_mut(),
-        |(mut digging, inventory, held_item)| {
-            // Advance progress depends on tool and the
-            // block kind: https://minecraft.gamepedia.com/Breaking#Speed
-            // * If the block requires some tool to harvest (i.e. it requires a tool to get the item after it breaks),
-            // then if that tool is not held, progress is hindered by a factor of 5. Otherwise, the hindrance
-            // is only a factor of 1.5.
-            // * If the player's tool helps dig the block (e.g. shovel => dirt, pickaxe => cobblestone),
-            // then a constant mutliplier is applied to the dig speed depending on the tool's material.
-            // This is retrieved through the `dig_multiplier` property on `ToolMaterial`.
+        |(mut digging, inventory, held_item, position)| {
             let block = game.block_at(digging.pos).unwrap_or_default();
-            let best_tool = block.kind().best_tool();
-            let best_tool_required = block.kind().best_tool_required();
-
             let item_in_main_hand: Slot = inventory
                 .item_at(Area::Hotbar, held_item.0)
                 .expect("held item out of bounds");
-            let held_tool = item_in_main_hand.map(|item| item.ty.tool()).flatten();
 
-            let multiplier = if best_tool == held_tool && best_tool.is_some() {
-                let dig_multiplier = item_in_main_hand
-                    .unwrap()
-                    .ty
-                    .tool_material()
-                    .map(|mat| mat.dig_multiplier())
-                    .unwrap_or_else(|| {
-                        // Missing data in feather-definitions;
-                        // panic. (TODO: maybe this should just be a log message)
-                        panic!(
-                            "no tool material for item {:?}, even though it has a tool",
-                            item_in_main_hand
-                        )
-                    });
-
-                (1.0 / 1.5) * dig_multiplier
-            } else if best_tool_required {
-                1.0 / 5.0
-            } else {
-                1.0 / 1.5
-            };
+            //TODO reset progress if item switched
+            let multiplier =
+                get_dig_multiplier(block, item_in_main_hand, position.on_ground, false); //TODO in_water
 
             digging.progress += (1.0 / TPS as f64) * multiplier;
+            log::debug!(
+                "added progress to digging, multiplier is {:?}, requires {:?}, is now = {:?}",
+                multiplier,
+                digging.time,
+                digging.progress
+            );
         },
     );
+}
+
+fn get_dig_multiplier(
+    block: BlockId,
+    item_in_main_hand: Slot,
+    on_ground: bool,
+    in_water: bool,
+) -> f64 {
+    // Progress depends on tool and the block kind: https://minecraft.gamepedia.com/Breaking#Speed
+    // * If the block requires some tool to harvest (i.e. it requires a tool to get the item after it breaks),
+    // then if that tool is not held, progress is hindered by a factor of 5. Otherwise, the hindrance
+    // is only a factor of 1.5.
+    // * If the player's tool helps dig the block (e.g. shovel => dirt, pickaxe => cobblestone),
+    // then a constant mutliplier is applied to the dig speed depending on the tool's material.
+    // This is retrieved through the `dig_multiplier` property on `ToolMaterial`.
+    let best_tool = block.kind().best_tool();
+    let best_tool_required = block.kind().best_tool_required();
+
+    let held_tool = item_in_main_hand.map(|item| item.ty.tool()).flatten();
+
+    let mut multiplier = if best_tool == held_tool && best_tool.is_some() {
+        let tool_multiplier = item_in_main_hand
+            .unwrap()
+            .ty
+            .tool_material()
+            .map(|mat| mat.dig_multiplier())
+            .unwrap_or_else(|| {
+                // Missing data in feather-definitions;
+                // panic. (TODO: maybe this should just be a log message)
+                panic!(
+                    "no tool material for item {:?}, even though it has a tool",
+                    item_in_main_hand
+                )
+            });
+        let efficiency_addition = 0.0; //TODO: if enchanted, efficiencyLevel ^ 2 + 1
+
+        (1.0 / 1.5) * (tool_multiplier + efficiency_addition)
+    } else if best_tool_required {
+        1.0 / 5.0
+    } else {
+        1.0 / 1.5
+    };
+
+    //TODO: if haste effect, multiplier *= 1 + (0.2 * hasteLevel)
+    //TODO: if mining fatigue effect, multiplier /= (3 ^ miningFatigueLevel)
+
+    if !on_ground {
+        multiplier /= 5.0;
+    }
+
+    if in_water {
+        multiplier /= 5.0;
+    }
+
+    multiplier
 }
 
 fn handle_cancelled_digging(game: &mut Game, world: &mut World, player: Entity) {
