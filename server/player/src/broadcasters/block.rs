@@ -50,7 +50,9 @@ pub fn broadcast_block_break_animation(game: &mut Game, world: &mut World) {
         <(Read<Digging>, Read<NetworkId>, Write<LastDestroyStage>)>::query()
             .iter_entities_mut(world.inner_mut())
     {
-        let destroy_stage = ((digging.progress / digging.time) * 9.0).floor().min(9.0) as i8;
+        let destroy_stage = ((digging.progress / digging.required) * 9.0)
+            .floor()
+            .min(9.0) as i8;
         if destroy_stage == last_destroy_stage.0 {
             return; // no new data to send
         }

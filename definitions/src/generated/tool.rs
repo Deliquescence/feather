@@ -158,9 +158,12 @@ impl crate::BlockKind {
             crate::BlockKind::Cobblestone => Some(crate::Tool::Pickaxe),
             crate::BlockKind::Dirt => Some(crate::Tool::Shovel),
             crate::BlockKind::GrassBlock => Some(crate::Tool::Shovel),
+            crate::BlockKind::Netherrack => Some(crate::Tool::Pickaxe),
             crate::BlockKind::RedSand => Some(crate::Tool::Shovel),
             crate::BlockKind::Sand => Some(crate::Tool::Shovel),
             crate::BlockKind::Sandstone => Some(crate::Tool::Pickaxe),
+            crate::BlockKind::Snow => Some(crate::Tool::Shovel),
+            crate::BlockKind::SnowBlock => Some(crate::Tool::Shovel),
             crate::BlockKind::Stone => Some(crate::Tool::Pickaxe),
             _ => None,
         }

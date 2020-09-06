@@ -32,10 +32,21 @@ pub struct Digging {
     /// The position of the block being dug
     pub pos: BlockPosition,
     /// The total time (in seconds) of digging needed
-    pub time: f64,
+    pub required: f64,
     /// Progress made, in seconds (better tools increase this
     /// value faster)
     pub progress: f64,
+    /// Current speed multiplier factoring in all tools, effects, etc.
+    pub multiplier: f64,
+}
+
+/// Keeps track of the digging delay for a player.
+/// After breaking a block, there is a 0.25 second delay
+/// before the next one can start breaking.
+/// (Unless it was broken in 0.05 seconds or less,)
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DiggingDelay {
+    pub remaining: f64,
 }
 
 /// System responsible for polling for PlayerDigging
@@ -71,7 +82,9 @@ fn handle_digging(game: &mut Game, world: &mut World, player: Entity, packet: Pl
 
     match packet.status {
         PlayerDiggingStatus::StartedDigging => handle_started_digging(game, world, player, packet),
-        PlayerDiggingStatus::CancelledDigging => handle_cancelled_digging(game, world, player),
+        PlayerDiggingStatus::CancelledDigging => {
+            handle_cancelled_digging(game, world, player, packet)
+        }
         PlayerDiggingStatus::FinishedDigging => {
             handle_finished_digging(game, world, player, packet)
         }
@@ -80,6 +93,15 @@ fn handle_digging(game: &mut Game, world: &mut World, player: Entity, packet: Pl
 }
 
 const MAX_DIG_RADIUS_SQUARED: f64 = 36.0;
+/// We will not trust the client if it says it finished digging more than
+/// this many seconds before we think it should be finished.
+const FINISHED_DIGGING_TOLERANCE: f64 = 0.20;
+/// Seconds of delay after breaking a block until the next one can start breaking.
+/// (instant or very fast breaks do not cause delay)
+const DIGGING_DELAY: f64 = 0.25;
+/// Block breaks which take this long (or are even faster)
+/// do not cause delay after breaking.
+const FAST_BREAK_THRESHOLD: f64 = 0.05;
 
 /// Event triggered when the `Digging` component is added to a player.
 ///
@@ -105,7 +127,18 @@ fn handle_started_digging(
     player: Entity,
     packet: PlayerDigging,
 ) {
-    // Delete old `Digging`, if it exists
+    // If old `Digging` exists, it may be from a very fast digging which we haven't handled yet.
+    if let Some(mut old_digging) = world.try_get::<Digging>(player).map(|d| *d) {
+        let block = game.block_at(old_digging.pos).unwrap_or_default();
+        let item_in_main_hand = get_item_in_main_hand(player, world);
+        // Generously assume the player is on the ground and not in water,
+        // because for example if they hold jump and keep digging then
+        // we may not notice that they actually did spend enough time to break the bock.
+        old_digging.multiplier = get_dig_multiplier(block, item_in_main_hand, true, false);
+        old_digging.progress += old_digging.multiplier * FAST_BREAK_THRESHOLD;
+
+        finish_fast_digging(game, world, player, old_digging);
+    }
     let _ = world.remove::<Digging>(player);
 
     // Check the distance isn't too far.
@@ -115,7 +148,6 @@ fn handle_started_digging(
         .distance_squared_to(*world.get::<Position>(player))
         > MAX_DIG_RADIUS_SQUARED
     {
-        // Ignore the packet.
         log::trace!("player {:?} tried to dig too far", player);
         return;
     }
@@ -129,19 +161,27 @@ fn handle_started_digging(
             .hardness()
             < 0.01
     {
-        dig(game, world, player, packet.location);
+        dig(game, world, player, packet.location, false);
     } else {
-        // Insert new `Digging`.
         let block = game.block_at(packet.location).unwrap_or_default();
         let hardness = block.kind().hardness();
+
+        let item_in_main_hand = get_item_in_main_hand(player, world);
+        let multiplier = get_dig_multiplier(
+            block,
+            item_in_main_hand,
+            world.get::<Position>(player).on_ground,
+            false, //TODO in_water
+        );
 
         world
             .add(
                 player,
                 Digging {
                     pos: packet.location,
-                    time: hardness,
+                    required: hardness,
                     progress: 0.0,
+                    multiplier,
                 },
             )
             .unwrap();
@@ -152,31 +192,37 @@ fn handle_started_digging(
 /// System to advance the digging progress.
 #[fecs::system]
 pub fn advance_dig_progress(game: &mut Game, world: &mut World) {
+    <Write<DiggingDelay>>::query().par_for_each_mut(world.inner_mut(), |mut delay| {
+        if delay.remaining > 0.0 {
+            delay.remaining -= 1.0 / TPS as f64;
+        }
+    });
     <(
         Write<Digging>,
         Read<Inventory>,
         Read<HeldItem>,
         Read<Position>,
+        Read<DiggingDelay>,
     )>::query()
     .par_for_each_mut(
         world.inner_mut(),
-        |(mut digging, inventory, held_item, position)| {
+        |(mut digging, inventory, held_item, position, delay)| {
+            if delay.remaining > 0.0 {
+                return; // Cannot progress on next block yet
+            }
+            if digging.progress > digging.required {
+                return; // No need to advance past maximum requirement
+            }
             let block = game.block_at(digging.pos).unwrap_or_default();
-            let item_in_main_hand: Slot = inventory
+            let item_in_main_hand = inventory
                 .item_at(Area::Hotbar, held_item.0)
                 .expect("held item out of bounds");
 
             //TODO reset progress if item switched
-            let multiplier =
+            digging.multiplier =
                 get_dig_multiplier(block, item_in_main_hand, position.on_ground, false); //TODO in_water
 
-            digging.progress += (1.0 / TPS as f64) * multiplier;
-            log::debug!(
-                "added progress to digging, multiplier is {:?}, requires {:?}, is now = {:?}",
-                multiplier,
-                digging.time,
-                digging.progress
-            );
+            digging.progress += (1.0 / TPS as f64) * digging.multiplier;
         },
     );
 }
@@ -236,12 +282,56 @@ fn get_dig_multiplier(
     multiplier
 }
 
-fn handle_cancelled_digging(game: &mut Game, world: &mut World, player: Entity) {
+/// System to break blocks which were broken very quickly (and thus not reported as finished by client)
+#[fecs::system]
+pub fn finish_fast_diggings(game: &mut Game, world: &mut World) {
+    world
+        .inner()
+        .iter_entities()
+        .filter(|e| {
+            world
+                .try_get::<DiggingDelay>(*e)
+                .map(|d| d.remaining <= 0.0)
+                .unwrap_or(false)
+        })
+        .filter_map(|e| world.try_get::<Digging>(e).map(|d| (e, *d)))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|(player, digging)| finish_fast_digging(game, world, player, digging));
+}
+
+fn finish_fast_digging(game: &mut Game, world: &mut World, player: Entity, digging: Digging) {
+    // Only break fast blocks because the client will not send finished digging for them.
+    // If it is slow then we wait for the client to confirm it is done,
+    // so that blocks aren't broken when it doesn't expect it.
+    if digging.progress >= digging.required
+        && digging.required / digging.multiplier <= FAST_BREAK_THRESHOLD
+    {
+        dig(game, world, player, digging.pos, false);
+        let _ = world.remove::<Digging>(player);
+        game.handle(world, FinishDiggingEvent { player, digging });
+    }
+}
+
+fn handle_cancelled_digging(
+    game: &mut Game,
+    world: &mut World,
+    player: Entity,
+    packet: PlayerDigging,
+) {
     let digging = world.try_get::<Digging>(player).map(|d| *d);
-    let _ = world.remove::<Digging>(player);
 
     if let Some(digging) = digging {
-        game.handle(world, FinishDiggingEvent { player, digging });
+        if digging.pos == packet.location {
+            let _ = world.remove::<Digging>(player);
+            game.handle(world, FinishDiggingEvent { player, digging });
+        } else {
+            log::trace!(
+                "Cancelled digging on somewhere other than current. Cancelled {:?}, Currently {:?}",
+                packet.location,
+                digging
+            );
+        }
     }
 }
 
@@ -258,12 +348,12 @@ fn handle_finished_digging(
                 // Can insta-break - no `StartedDigging` needed
                 Digging {
                     pos: packet.location,
-                    time: 0.0,
+                    required: 0.0,
                     progress: 0.0,
+                    multiplier: 0.0,
                 }
             } else {
-                // Player can't insta-break and has
-                // not sent StartedDigging.
+                // Player can't insta-break and has not sent StartedDigging.
                 // They cannot finish.
                 return;
             }
@@ -276,14 +366,32 @@ fn handle_finished_digging(
         return;
     }
 
-    // Attempt to break the block
-    dig(game, world, player, digging.pos);
+    if digging.progress + FINISHED_DIGGING_TOLERANCE >= digging.required {
+        // Attempt to break the block
+        dig(game, world, player, digging.pos, true);
 
-    // Finished
-    game.handle(world, FinishDiggingEvent { player, digging });
+        // Finished
+        game.handle(world, FinishDiggingEvent { player, digging });
+    } else {
+        log::trace!("Not trusting clients finished digging packet because digging progress is only {:?} but requirement is {:?}", digging.progress, digging.required);
+    }
 }
 
-fn dig(game: &mut Game, world: &mut World, player: Entity, pos: BlockPosition) {
+fn dig(game: &mut Game, world: &mut World, player: Entity, pos: BlockPosition, cause_delay: bool) {
+    if let Some(block) = break_block(game, world, player, pos) {
+        damage_tool(player, block, game, world);
+        if cause_delay {
+            world.get_mut::<DiggingDelay>(player).remaining = DIGGING_DELAY;
+        }
+    }
+}
+
+fn break_block(
+    game: &mut Game,
+    world: &mut World,
+    player: Entity,
+    pos: BlockPosition,
+) -> Option<BlockId> {
     let block = match game.block_at(pos) {
         Some(block) => block,
         None => {
@@ -296,11 +404,9 @@ fn dig(game: &mut Game, world: &mut World, player: Entity, pos: BlockPosition) {
                 ),
             );
 
-            return;
+            return None;
         }
     };
-
-    damage_tool(player, block, game, world);
 
     // Handle multi-block destruction (i.e. doors and beds)
     if let Some(other_pos) = match block.simplified_kind() {
@@ -330,6 +436,7 @@ fn dig(game: &mut Game, world: &mut World, player: Entity, pos: BlockPosition) {
     }
 
     game.set_block_at(world, pos, BlockId::air(), BlockUpdateCause::Entity(player));
+    Some(block)
 }
 
 fn damage_tool(player: Entity, block: BlockId, game: &mut Game, world: &mut World) {
@@ -337,12 +444,7 @@ fn damage_tool(player: Entity, block: BlockId, game: &mut Game, world: &mut Worl
         return; // Instant break should not cause damage
     }
 
-    let held_item = world.get::<HeldItem>(player).0;
-    let inventory = world.get::<Inventory>(player);
-
-    let item_in_main_hand: Slot = inventory
-        .item_at(Area::Hotbar, held_item)
-        .expect("held item out of bounds");
+    let item_in_main_hand = get_item_in_main_hand(player, world);
 
     if let Some(item) = item_in_main_hand {
         let damage_taken = if item.ty == Item::Trident {
@@ -357,7 +459,7 @@ fn damage_tool(player: Entity, block: BlockId, game: &mut Game, world: &mut Worl
             }
         };
 
-        drop(inventory);
+        let held_item = world.get::<HeldItem>(player).0;
         let damage_event = ItemDamageEvent {
             player,
             slot: slot(Area::Hotbar, held_item),
@@ -365,6 +467,15 @@ fn damage_tool(player: Entity, block: BlockId, game: &mut Game, world: &mut Worl
         };
         game.handle(world, damage_event);
     }
+}
+
+fn get_item_in_main_hand(player: Entity, world: &World) -> Slot {
+    let held_item = world.get::<HeldItem>(player).0;
+    let inventory = world.get::<Inventory>(player);
+
+    inventory
+        .item_at(Area::Hotbar, held_item)
+        .expect("held item out of bounds")
 }
 
 fn handle_drop_item_stack(

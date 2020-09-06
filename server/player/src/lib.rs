@@ -116,6 +116,7 @@ pub fn create(game: &mut Game, world: &mut World, info: NewClientInfo) -> Entity
 
     world.add(entity, CanRespawn).unwrap();
     world.add(entity, MaxHealth(20)).unwrap();
+    world.add(entity, DiggingDelay::default()).unwrap();
     world
         .add(entity, Health(info.data.animal.health as u32))
         .unwrap();

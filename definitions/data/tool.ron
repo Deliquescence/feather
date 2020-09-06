@@ -98,8 +98,8 @@ Multiple([
         type: Custom("tool"),
         mapping: {
             // TODO
-            ["dirt", "grass_block", "sand", "red_sand"]: "shovel",
-            ["stone", "cobblestone", "sandstone"]: "pickaxe",
+            ["dirt", "grass_block", "sand", "red_sand", "snow", "snow_block"]: "shovel",
+            ["stone", "cobblestone", "sandstone", "netherrack"]: "pickaxe",
         },
     ),
     // Defines whether the best tool is required
